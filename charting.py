@@ -1,4 +1,8 @@
 import time, requests
+import os
+from dotenv import load_dotenv
+load_dotenv()
+ETHERSCAN_KEY = os.getenv("ETHERSCAN_API_KEY")  # load from env
 
 def get_first_tx_block(addr):
     import requests
@@ -11,7 +15,7 @@ def get_first_tx_block(addr):
         "page": 1,
         "offset": 1,
         "sort": "asc",
-        "apikey": "HGCJYT8W76BEZJKVTPEMUP8BYA9APJEQRR",
+        "apikey": ETHERSCAN_KEY,
     }
     r = requests.get(url, params=params, timeout=30).json()
     if r.get("status") != "1" or not r.get("result"):
@@ -20,31 +24,40 @@ def get_first_tx_block(addr):
     return int(r["result"][0]["blockNumber"])
 
 def getERC20Transactions(address, startBlock, endBlock, contract_address=None, max_pages=1):
-    api_keys = ["HGCJYT8W76BEZJKVTPEMUP8BYA9APJEQRR", "NTCY5CQPJYV71MABW6SCSMVVBNJPYXBK82"]
+    if not ETHERSCAN_KEY:
+        raise RuntimeError("Missing ETHERSCAN_API_KEY environment variable")
+
     base_url = "https://api.etherscan.io/v2/api"
     chainid = 1
 
-    all_txs, page, offset, key_idx = [], 1, 10000, 0
+    all_txs = []
+    page = 1
+    offset = 10000
 
     while page <= max_pages:
         params = {
-            "chainid": chainid, "module": "account", "action": "tokentx",
-            "address": str(address), "page": page, "offset": offset,
-            "startblock": int(startBlock), "endblock": int(endBlock),
-            "sort": "asc", "apikey": api_keys[key_idx],
+            "chainid": chainid,
+            "module": "account",
+            "action": "tokentx",
+            "address": str(address),
+            "page": page,
+            "offset": offset,
+            "startblock": int(startBlock),
+            "endblock": int(endBlock),
+            "sort": "asc",
+            "apikey": ETHERSCAN_KEY,
         }
+
         if contract_address:
             params["contractaddress"] = str(contract_address)
 
-        # retry a few times on timeouts/temporary issues
+        # retry logic
         for attempt in range(5):
             try:
                 r = requests.get(base_url, params=params, timeout=60)
                 r.raise_for_status()
                 payload = r.json()
                 break
-            except requests.exceptions.ReadTimeout:
-                time.sleep(1.5 * (attempt + 1))
             except requests.exceptions.RequestException:
                 time.sleep(1.5 * (attempt + 1))
         else:
@@ -52,20 +65,22 @@ def getERC20Transactions(address, startBlock, endBlock, contract_address=None, m
 
         result = payload.get("result")
         status = payload.get("status")
-        message = payload.get("message")
 
-        if isinstance(result, str) and "rate limit" in result.lower():
-            key_idx = (key_idx + 1) % len(api_keys)
-            continue
-        if status == "0" and (message == "No transactions found" or result == []):
+        # no transactions
+        if status == "0" and (result == [] or payload.get("message") == "No transactions found"):
             break
+
+        # unexpected format
         if status != "1" or not isinstance(result, list):
-            print("Etherscan error:", message, "| result:", result)
+            print("Etherscan error:", payload.get("message"), "| result:", result)
             break
 
         all_txs.extend(result)
+
+        # last page
         if len(result) < offset:
             break
+
         page += 1
 
     return all_txs
