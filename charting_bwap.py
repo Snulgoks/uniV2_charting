@@ -235,6 +235,10 @@ def getTokenTransfers(token_contract, startBlock, endBlock, address=None, max_pa
 
     - If token_contract is not None: transfers for that token (optionally filtered by address).
     - If token_contract is None:     all token transfers for the given address in the block range.
+
+    Retries both:
+    - network / HTTP errors
+    - Etherscan API errors (non-OK status), except for the "no transactions found" case.
     """
     if not ETHERSCAN_KEY:
         raise RuntimeError("Missing ETHERSCAN_API_KEY environment variable")
@@ -248,6 +252,9 @@ def getTokenTransfers(token_contract, startBlock, endBlock, address=None, max_pa
     all_txs = []
     page = 1
     offset = 10000
+
+    max_attempts = 5
+    base_backoff = 1.5  # seconds
 
     while page <= max_pages:
         params = {
@@ -270,36 +277,56 @@ def getTokenTransfers(token_contract, startBlock, endBlock, address=None, max_pa
         if address:
             params["address"] = str(address)
 
-        # retry logic
-        for attempt in range(5):
+        # retry logic (network + etherscan errors)
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 r = requests.get(base_url, params=params, timeout=60)
                 r.raise_for_status()
                 payload = r.json()
-                break
-            except requests.exceptions.RequestException:
-                time.sleep(1.5 * (attempt + 1))
-        else:
-            raise RuntimeError(f"Etherscan request keeps timing out for blocks {startBlock}-{endBlock}")
+            except requests.exceptions.RequestException as e:
+                if attempt >= max_attempts:
+                    raise RuntimeError(
+                        f"Etherscan request keeps failing "
+                        f"for blocks {startBlock}-{endBlock}, page {page}: {e}"
+                    )
+                time.sleep(base_backoff * attempt)
+                continue
 
-        result = payload.get("result")
-        status = payload.get("status")
-        msg = payload.get("message")
+            # Parse Etherscan response
+            result = payload.get("result")
+            status = str(payload.get("status", ""))  # etherscan usually "1" or "0"
+            msg = payload.get("message", "")
 
-        if status == "0" and (result == [] or msg == "No transactions found"):
-            break
-        if status != "1" or not isinstance(result, list):
-            print("Etherscan error:", msg, "| result:", result)
-            break
+            # "No transactions found" is a terminal success (no need to retry)
+            if status == "0" and (result == [] or msg == "No transactions found"):
+                # nothing more for this range; exit pagination entirely
+                return all_txs
 
+            # Any other non-success status from Etherscan: retry a few times
+            if status != "1" or not isinstance(result, list):
+                if attempt >= max_attempts:
+                    raise RuntimeError(
+                        f"Etherscan error for blocks {startBlock}-{endBlock}, page {page}: "
+                        f"status={status}, message={msg}, result={result}"
+                    )
+                time.sleep(base_backoff * attempt)
+                continue
+
+            # Success case: valid list of txs
+            break  # exit retry loop, process this page
+
+        # accumulate page results
         all_txs.extend(result)
+
+        # If we got fewer than `offset` results, we've reached the last page.
         if len(result) < offset:
             break
 
         page += 1
 
     return all_txs
-
 
 def getAllTransfers(token_contract=None, maxLen=None, startBlock=None, endBlock=None, holder_address=None):
     all_txs = []
@@ -361,8 +388,7 @@ def getAllTransfers(token_contract=None, maxLen=None, startBlock=None, endBlock=
     print("fetched transactions:", len(all_txs))
     return all_txs
 
-
-from bisect import bisect_left
+import bisect
 from collections import defaultdict
 
 def buildHoldersDict(
@@ -372,9 +398,11 @@ def buildHoldersDict(
     pair_addresses,
     avg_time_threshold=None,
     trxCountThreshold=None,
-    min_snapshot_delta=0  # <--- NEW: minimum seconds between snapshots
+    min_snapshot_delta=0,
+    track_trades=True,
+    snapshot_full=False,
+    verbose=False
 ):
-
     # ----------------------------------
     # 0. PREP FAST STRUCTURES
     # ----------------------------------
@@ -383,200 +411,211 @@ def buildHoldersDict(
     HUB = {"0x6ae83320fe7508489c3c2e2575e084c0af9689f1"}
     SKIP = pair_set | HUB | {ZERO}
 
-    # Precompute maps for speed
-    all_txs.sort(key=lambda x: int(x["timeStamp"]))
-    x_axis_sorted = sorted(x_axis)
+    # Pre-convert ALL timestamps to int ONCE
+    for tx in all_txs:
+        tx["timeStamp"] = int(tx["timeStamp"])
+    all_txs.sort(key=lambda x: x["timeStamp"])
+
+    # Ensure x_axis is int and sorted; assume already aligned with y_axis
+    x_axis_sorted = [int(x) for x in x_axis]
+    y_axis_ref = list(y_axis)
+    n_prices = len(x_axis_sorted)
+
+    if n_prices == 0:
+        raise ValueError("x_axis/y_axis must not be empty")
 
     # ----------------------------------
-    # 1. ACTIVITY ANALYSIS (FAST)
+    # 1. ACTIVITY ANALYSIS + ALLOWED MAP
     # ----------------------------------
     addr_ts = defaultdict(list)
     for tx in all_txs:
-        t = int(tx["timeStamp"])
+        t = tx["timeStamp"]
         addr_ts[tx["from"]].append(t)
         addr_ts[tx["to"]].append(t)
 
-    addr_activity = {}
+    allowed_map = {}
+    use_filters = (avg_time_threshold is not None and trxCountThreshold is not None)
+
     for addr, times in addr_ts.items():
-        times.sort()
+        if addr in SKIP:
+            allowed_map[addr] = False
+            continue
+
         cnt = len(times)
-        if cnt < 2:
-            avg_int = None
+        if not use_filters or cnt < 2:
+            allowed_map[addr] = True
+            continue
+
+        # Compute average interval between transactions
+        times.sort()
+        total_gap = 0
+        for i in range(1, cnt):
+            total_gap += times[i] - times[i - 1]
+        avg_int = total_gap / (cnt - 1)
+
+        # Exclude likely bots: high frequency + high count
+        if cnt > trxCountThreshold and avg_int < avg_time_threshold:
+            allowed_map[addr] = False
         else:
-            total_gap = 0
-            prev = times[0]
-            for i in range(1, cnt):
-                cur = times[i]
-                total_gap += cur - prev
-                prev = cur
-            avg_int = total_gap / (cnt - 1)
-        addr_activity[addr] = (avg_int, cnt)
+            allowed_map[addr] = True
 
     def allowed(addr):
-        if addr in SKIP:
-            return False
-        avg_i, cnt = addr_activity.get(addr, (None, 0))
-        if avg_i is None:
-            return True
-        if avg_time_threshold is None or trxCountThreshold is None:
-            return True
-        return not (cnt > trxCountThreshold and avg_i < avg_time_threshold)
+        return allowed_map.get(addr, False)
 
     # ----------------------------------
-    # 2. UNION–FIND (VERY FAST)
+    # 2. UNION–FIND + LIVE CLUSTERS
     # ----------------------------------
     parent = {}
     adjacency = defaultdict(set)
+    clusters_map = {}  # root -> set of addresses
 
     def find(a):
-        # iterative with path compression
+        if a not in parent:
+            parent[a] = a
+            clusters_map[a] = {a}
+            return a
+        # Path compression
         while parent[a] != a:
             parent[a] = parent[parent[a]]
             a = parent[a]
         return a
 
     def union(a, b):
-        if not allowed(a) or not allowed(b):
+        if not (allowed(a) and allowed(b)):
             return
         adjacency[a].add(b)
         adjacency[b].add(a)
-        parent.setdefault(a, a)
-        parent.setdefault(b, b)
         ra = find(a)
         rb = find(b)
         if ra != rb:
+            # Union by size
+            if len(clusters_map[ra]) < len(clusters_map[rb]):
+                ra, rb = rb, ra
+            clusters_map[ra] |= clusters_map[rb]
+            del clusters_map[rb]
             parent[rb] = ra
 
     # ----------------------------------
-    # 3. HOLDERS
+    # 3. HOLDERS (LIVE STATE)
     # ----------------------------------
     holders = {}
 
     def ensure(addr):
         if not allowed(addr):
             return None
-        return holders.setdefault(addr, {
-            "balance": 0,
-            "total_invested": 0.0,
-            "acquisitions": [],
-            "buys": [],
-            "sells": [],
-            "avg_price": 0.0,
-            "cluster_link_count": 0,
-        })
+        if addr not in holders:
+            h = {
+                "balance": 0,
+                "total_invested": 0.0,
+            }
+            if track_trades:
+                h["acquisitions"] = []
+                h["buys"] = []
+                h["sells"] = []
+            holders[addr] = h
+        return holders[addr]
 
     # ----------------------------------
-    # 4. SNAPSHOT OUTPUT
+    # 4. MAIN LOOP — OVER SNAPSHOTS
     # ----------------------------------
     holders_snaps = []
     clusters_snaps = []
     snapshotTimes = []
 
     tx_index = 0
-    n = len(all_txs)
+    n_txs = len(all_txs)
     total_snaps = len(x_axis_sorted)
+    last_snapshot_ts = None
 
-    last_snapshot_ts = None  # <--- NEW: track last snapshot timestamp
-
-    # ----------------------------------
-    # 5. MAIN LOOP — ULTRA FAST SCAN
-    # ----------------------------------
     for i, ts_snap in enumerate(x_axis_sorted):
-
-        # progress print (lightweight)
-        if i % 5000 == 0:
+        if verbose and i % 5000 == 0:
             print(f"Progress: {i}/{total_snaps} ({(i/total_snaps)*100:.1f}%)")
 
-        # process all tx up to this snapshot time
-        while tx_index < n and int(all_txs[tx_index]["timeStamp"]) <= ts_snap:
+        # Process all transactions up to current snapshot time
+        while tx_index < n_txs and all_txs[tx_index]["timeStamp"] <= ts_snap:
             tx = all_txs[tx_index]
             tx_index += 1
 
             sender = tx["from"]
             receiver = tx["to"]
             amount = int(tx["value"])
-            t = int(tx["timeStamp"])
+            t = tx["timeStamp"]
 
-            # price lookup using sorted x_axis
-            pos = bisect_left(x_axis_sorted, t)
+            # ✅ FAST NEAREST PRICE LOOKUP USING BISECT (O(log M))
+            pos = bisect.bisect_right(x_axis_sorted, t)
             if pos == 0:
-                price = y_axis[0]
-            elif pos == len(x_axis_sorted):
-                price = y_axis[-1]
+                idx = 0
+            elif pos == n_prices:
+                idx = n_prices - 1
             else:
-                before = x_axis_sorted[pos - 1]
-                after = x_axis_sorted[pos]
-                price = y_axis[pos - 1] if abs(t - before) < abs(t - after) else y_axis[pos]
-
+                t_left = x_axis_sorted[pos - 1]
+                t_right = x_axis_sorted[pos]
+                # Pick closer timestamp
+                idx = pos - 1 if (t - t_left) <= (t_right - t) else pos
+            price = y_axis_ref[idx]
             invested_value = price * amount
 
             h_s = ensure(sender)
             h_r = ensure(receiver)
 
-            # sender loses
-            if h_s and sender != ZERO:
+            # --- SENDER: decrease balance ---
+            if h_s is not None and sender != ZERO:
                 bal = h_s["balance"]
                 if bal > 0:
-                    avg_cost = h_s["total_invested"] / bal if h_s["total_invested"] > 0 else 0
+                    avg_cost = h_s["total_invested"] / bal
                     used = min(bal, amount)
                     h_s["total_invested"] -= avg_cost * used
                     if h_s["total_invested"] < 0:
-                        h_s["total_invested"] = 0
+                        h_s["total_invested"] = 0.0
                 h_s["balance"] -= amount
 
-            # receiver gains
-            if h_r:
+            # --- RECEIVER: increase balance ---
+            if h_r is not None:
                 h_r["balance"] += amount
                 h_r["total_invested"] += invested_value
-                h_r["acquisitions"].append({
-                    "amount": amount,
-                    "timestamp": t,
-                    "price": price,
-                    "value": invested_value,
-                })
+                if track_trades:
+                    h_r["acquisitions"].append({
+                        "amount": amount,
+                        "timestamp": t,
+                        "price": price,
+                        "value": invested_value,
+                    })
 
-            # classify buys/sells vs pair
-            if h_r and sender in pair_set and receiver not in pair_set:
-                h_r["buys"].append({
-                    "amount": amount,
-                    "timestamp": t,
-                    "price": price,
-                    "value": invested_value,
-                })
-            if h_s and receiver in pair_set and sender not in pair_set:
-                h_s["sells"].append({
-                    "amount": amount,
-                    "timestamp": t,
-                    "price": price,
-                    "value": invested_value,
-                })
+            # --- CLASSIFY BUYS/SELLS (only if tracking) ---
+            if track_trades:
+                sender_in_pair = sender in pair_set
+                receiver_in_pair = receiver in pair_set
+                if h_r is not None and sender_in_pair and not receiver_in_pair:
+                    h_r["buys"].append({
+                        "amount": amount,
+                        "timestamp": t,
+                        "price": price,
+                        "value": invested_value,
+                    })
+                if h_s is not None and receiver_in_pair and not sender_in_pair:
+                    h_s["sells"].append({
+                        "amount": amount,
+                        "timestamp": t,
+                        "price": price,
+                        "value": invested_value,
+                    })
 
-            # cluster graph
+            # --- UPDATE CLUSTER GRAPH ---
             union(sender, receiver)
 
-        # -------------------------
-        # SNAPSHOT DECISION
-        # -------------------------
+        # --- SNAPSHOT DELTA FILTER ---
         if last_snapshot_ts is not None and min_snapshot_delta > 0:
-            # skip snapshot if not enough time passed
             if ts_snap - last_snapshot_ts < min_snapshot_delta:
                 continue
-
-        # -------------------------
-        # CREATE SNAPSHOT
-        # -------------------------
         last_snapshot_ts = ts_snap
 
-        # update avg_price per holder
+        # --- UPDATE HOLDER METADATA (avg_price, link count) ---
         for addr, h in holders.items():
             bal = h["balance"]
             h["avg_price"] = (h["total_invested"] / bal) if bal > 0 else 0.0
+            h["cluster_link_count"] = len(adjacency.get(addr, ()))
 
-        # build clusters from union-find
-        clusters_map = defaultdict(set)
-        for a in parent:
-            clusters_map[find(a)].add(a)
-
+        # --- BUILD CLUSTERS SNAPSHOT ---
         clusters = []
         for members in clusters_map.values():
             total_bal = 0
@@ -586,25 +625,42 @@ def buildHoldersDict(
                 if h:
                     total_bal += h["balance"]
                     total_inv += h["total_invested"]
-            avg_p = (total_inv / total_bal) if total_bal else 0.0
-            clusters.append({
-                "members": set(members),  # copy
+            avg_p = total_inv / total_bal if total_bal > 0 else 0.0
+            # Store full member set only if snapshot_full=True
+            cluster_entry = {
                 "balance": total_bal,
                 "total_invested": total_inv,
                 "avg_price": avg_p,
-            })
+            }
+            if snapshot_full:
+                cluster_entry["members"] = set(members)  # copy to freeze state
+            else:
+                cluster_entry["member_count"] = len(members)
+            clusters.append(cluster_entry)
 
-        # cluster_link_count
-        for addr, h in holders.items():
-            h["cluster_link_count"] = len(adjacency.get(addr, ()))
+        # --- STORE HOLDER SNAPSHOT ---
+        if snapshot_full:
+            # Full copy (expensive)
+            snap_holders = {addr: dict(h) for addr, h in holders.items()}
+        else:
+            # Slim snapshot: only essential fields
+            snap_holders = {
+                addr: {
+                    "balance": h["balance"],
+                    "avg_price": h["avg_price"],
+                    "cluster_link_count": h["cluster_link_count"],
+                }
+                for addr, h in holders.items()
+            }
 
-        # store snapshot
-        holders_snaps.append({k: v.copy() for k, v in holders.items()})
+        holders_snaps.append(snap_holders)
         clusters_snaps.append(clusters)
         snapshotTimes.append(ts_snap)
 
-    print("Progress: 100% — DONE!")
+    if verbose:
+        print("Progress: 100% — DONE!")
     return holders_snaps, clusters_snaps, snapshotTimes
+
 
 def balance_weighted_avg_price(obj):
     total_weight = 0
@@ -700,7 +756,11 @@ if __name__ == "__main__":
         '0xc38e4e6a15593f908255214653d3d947ca1c2338' #Mayan: Shift
     ]
     print('Building holders dict')
-    holders_snaps, clusters_snaps, snapshotTimes  = buildHoldersDict(all_txs, x_axis, y_axis, pair_addresses,avg_time_threshold=3600*12, trxCountThreshold=100, min_snapshot_delta = 3600)
+    start_time = time.time()
+    holders_snaps, clusters_snaps, snapshotTimes  = buildHoldersDict(all_txs, x_axis, y_axis, pair_addresses,avg_time_threshold=3600*24, trxCountThreshold=100, min_snapshot_delta = 3600*12, track_trades=False, snapshot_full=False, verbose = True )
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"Execution time: {execution_time} seconds")
 
     print('Displaying top cluster links')
     snapshot = holders_snaps[-1]   # pick latest snapshot (or any index)
