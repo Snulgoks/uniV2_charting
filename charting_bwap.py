@@ -590,11 +590,10 @@ def buildHoldersDict(
                 h_r["balance"] += amount
                 h_r["total_invested"] += invested_value
 
-            # --- CLASSIFY BUYS/SELLS (only if tracking) ---
+            # --- CLASSIFY BUYS/SELLS (track ALL inflows/outflows) ---
             if track_trades:
-                sender_in_pair = sender in pair_set
-                receiver_in_pair = receiver in pair_set
-                if h_r is not None and sender_in_pair and not receiver_in_pair:
+                # Every incoming transfer → "buy" for receiver (if tracked)
+                if h_r is not None:
                     h_r["buys"].append({
                         "amount": amount,
                         "timestamp": t,
@@ -602,7 +601,8 @@ def buildHoldersDict(
                         "value": invested_value,
                         "hash": tx_hash,
                     })
-                if h_s is not None and receiver_in_pair and not sender_in_pair:
+                # Every outgoing transfer → "sell" for sender (if tracked, ignore ZERO)
+                if h_s is not None and sender != ZERO:
                     h_s["sells"].append({
                         "amount": amount,
                         "timestamp": t,
@@ -659,7 +659,7 @@ def buildHoldersDict(
                     "cluster_link_count": h["cluster_link_count"],
                 }
                 if track_trades:
-                    # ❗ FIX: copy lists so old snapshots don't mutate
+                    # copy lists so snapshots are immutable
                     h_copy["buys"] = [trade.copy() for trade in h["buys"]]
                     h_copy["sells"] = [trade.copy() for trade in h["sells"]]
                 snap_holders[addr] = h_copy
@@ -680,6 +680,7 @@ def buildHoldersDict(
     if verbose:
         print("Progress: 100% — DONE!")
     return holders_snaps, clusters_snaps, snapshotTimes
+
 
 def balance_weighted_avg_price(obj):
     total_weight = 0
@@ -797,14 +798,54 @@ def count_new_holders(holders_snaps, threshold):
 
     return counts
 
+def balance_change_of_holders_over_threshold(holders_snaps, threshold):
+    """
+    For each snapshot i, compute the sum of balance changes for all addresses
+    that (in snapshot i) have balance > threshold.
+
+    For a given snapshot i:
+        - Only consider addresses where balance_i > threshold.
+        - For each such address:
+              delta = balance_i - balance_(i-1)
+          where balance_(i-1) is 0 if the address did not exist previously.
+        - Sum these deltas over all such addresses.
+
+    Returns:
+        A list 'results' where results[i] is the summed balance change for
+        snapshot i relative to snapshot i-1.
+
+    Note:
+        - For i = 0, the "previous" balance is treated as 0 for all addresses,
+          so results[0] is effectively the sum of balances of all over-threshold
+          holders in the first snapshot.
+    """
+    results = []
+    prev_snapshot = {}
+
+    for snap in holders_snaps:
+        total_delta = 0
+
+        for addr, h in snap.items():
+            cur_bal = h.get("balance", 0)
+
+            # Only classify as holder based on *current* snapshot
+            if cur_bal > threshold:
+                prev_bal = prev_snapshot.get(addr, {}).get("balance", 0)
+                total_delta += (cur_bal - prev_bal)
+
+        results.append(total_delta)
+        prev_snapshot = snap
+
+    return results
+
 
 
 
 #Example usage:
 if __name__ == "__main__":
     token0 = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
-    token1 = '0x9778ac3d5a2f916aa9abf1eb85c207d990ca2655'
-    pair = '0x7bdb64fb70adb01c7bbfed98e4def7df70c8318b'
+    token1 = '0x0f7dc5d02cc1e1f5ee47854d534d332a1081ccc8'
+    pair = '0xf97503af8230a7e72909d6614f45e88168ff3c10'
     maxLen = 10000000
     [x_axis, y_axis, liq, pool] = buildPoolChart(token0,token1,pair,maxLen , clean = 1)
     all_txs = getAllTransfers(token1, maxLen, 0, 30164015, holder_address=None)
@@ -880,6 +921,7 @@ if __name__ == "__main__":
     print('Getting new holder counts')
     HolderCount     = count_over_threshold(holders_snaps, 100)
     NewHoldersCount = count_new_holders(holders_snaps, 100)
+    totBoughtByHolders = balance_change_of_holders_over_threshold(holders_snaps, 100)
     
     print('Plotting chart')
     import matplotlib.pyplot as plt
@@ -907,7 +949,6 @@ if __name__ == "__main__":
     
     snap_x = np.array(snapshotTimes)
     
-    # Total holders as filled area
     ax2.fill_between(
         snap_x,
         HolderCount,
@@ -919,21 +960,18 @@ if __name__ == "__main__":
     
     
     # -----------------------------------------
-    # 3) THIRD AXIS (RIGHT, OFFSET): NEW HOLDERS
+    # 3) THIRD AXIS (RIGHT OFFSET): NEW HOLDERS
     # -----------------------------------------
     ax3 = ax1.twinx()
     
-    # Offset the third axis so it doesn't overlap with ax2
     ax3.spines["right"].set_position(("axes", 1.12))
     ax3.set_frame_on(True)
     ax3.patch.set_visible(False)
-    
     for sp in ax3.spines.values():
         sp.set_visible(True)
     
     ax3.set_ylabel("New Holders")
     
-    # Very visible bold line for new holders
     ax3.plot(
         snap_x,
         NewHoldersCount,
@@ -944,18 +982,43 @@ if __name__ == "__main__":
     
     
     # -----------------------------------------
-    # Combined legend collecting from all axes
+    # 4) FOURTH AXIS (RIGHT OFFSET 2): Tokens bought by existing holders
+    # -----------------------------------------
+    ax4 = ax1.twinx()
+    
+    # Push this axis even further right
+    ax4.spines["right"].set_position(("axes", 1.24))
+    ax4.set_frame_on(True)
+    ax4.patch.set_visible(False)
+    for sp in ax4.spines.values():
+        sp.set_visible(True)
+    
+    ax4.set_ylabel("Tokens bought by existing holders")
+    
+    ax4.plot(
+        snap_x,
+        totBoughtByHolders,
+        color="purple",
+        linewidth=2.5,
+        linestyle="--",
+        label="Bought by existing holders"
+    )
+    
+    
+    # -----------------------------------------
+    # Combined legend
     # -----------------------------------------
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     lines3, labels3 = ax3.get_legend_handles_labels()
+    lines4, labels4 = ax4.get_legend_handles_labels()
     
     ax1.legend(
-        lines1 + lines2 + lines3,
-        labels1 + labels2 + labels3,
+        lines1 + lines2 + lines3 + lines4,
+        labels1 + labels2 + labels3 + labels4,
         loc="upper left"
     )
     
-    plt.title("Price, BWAP, Holder Count and New Holders (3-axis view)")
+    plt.title("Price, BWAP, Holder Count, New Holders, and Tokens Bought by Existing Holders")
     plt.tight_layout()
     plt.show()
