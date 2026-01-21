@@ -85,32 +85,127 @@ def getERC20Transactions(address, startBlock, endBlock, contract_address=None, m
 
     return all_txs
 
+import os
+import json
+
+DB_DIR = "databases"
+
+
+def _ensure_db_dir():
+    if not os.path.isdir(DB_DIR):
+        os.makedirs(DB_DIR, exist_ok=True)
+
+
+def _get_db_path(address, contract_address=None):
+    _ensure_db_dir()
+    # keep it simple; normalize a bit so filenames are predictable
+    addr_part = address.lower()
+    contract_part = (contract_address or "all").lower()
+    filename = f"{addr_part}__{contract_part}.json"
+    return os.path.join(DB_DIR, filename)
+
+
+def _load_cached_transactions(address, contract_address=None):
+    path = _get_db_path(address, contract_address)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # ensure it's a list
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"Failed to load cache for {address} ({contract_address}): {e}")
+        return []
+
+
+def _save_cached_transactions(address, contract_address, txs):
+    path = _get_db_path(address, contract_address)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(txs, f)
+    except Exception as e:
+        print(f"Failed to save cache for {address} ({contract_address}): {e}")
+
+
 def getAllERC20Transactions(address, maxLen, startBlock, endBlock, contract_address=None):
-    all_txs = []
-    cur = int(startBlock)
+    startBlock = int(startBlock)
     endBlock = int(endBlock)
 
+    # Load any cached data first
+    cached_txs = _load_cached_transactions(address, contract_address)
+
+    def in_range(tx):
+        b = int(tx["blockNumber"])
+        return startBlock <= b <= endBlock
+
+    # Transactions from cache within the requested range
+    result_txs = [tx for tx in cached_txs if in_range(tx)]
+
+    # If maxLen is set and cache alone already satisfies it, just return
+    if maxLen is not None and len(result_txs) >= maxLen:
+        print(
+            "loaded transactions from cache for",
+            address,
+            f"(returning first {maxLen} in range)",
+        )
+        return result_txs[:maxLen]
+
+    # Determine where to continue fetching from
+    if cached_txs:
+        last_cached_block = max(int(tx["blockNumber"]) for tx in cached_txs)
+    else:
+        last_cached_block = None
+
+    # If cache already extends past or up to endBlock, no need to fetch more
+    if last_cached_block is not None and last_cached_block >= endBlock:
+        # still just return what caller asked for
+        print("loaded transactions from cache for", address, len(result_txs))
+        # apply maxLen at the end as a safety
+        if maxLen is not None:
+            return result_txs[:maxLen]
+        return result_txs
+
+    # Otherwise, figure out the starting block for new fetches
+    if last_cached_block is not None:
+        # continue from the block after our last cached one, but not before requested startBlock
+        cur = max(startBlock, last_cached_block + 1)
+    else:
+        cur = startBlock
+
+    all_txs_for_db = list(cached_txs)  # full DB content (cache + new)
+
     while cur <= endBlock:
-        # fetch from current cursor to the final endBlock
         txs = getERC20Transactions(
             address,
             cur,
             endBlock,
             contract_address=contract_address,
-            max_pages=1
+            max_pages=1,
         )
         print(address, cur, endBlock, len(txs))
 
         if not txs:
             break
 
-        all_txs.extend(txs)
+        # Add these to DB
+        all_txs_for_db.extend(txs)
 
-        if maxLen is not None and len(all_txs) >= maxLen:
-            print('fetched transactions (maxLen reached) for', address, len(all_txs))
-            return all_txs
+        # Add to result list only if within requested range
+        for tx in txs:
+            if in_range(tx):
+                result_txs.append(tx)
+                # Respect maxLen for what we *return* this call
+                if maxLen is not None and len(result_txs) >= maxLen:
+                    print(
+                        "fetched transactions (maxLen reached) for",
+                        address,
+                        len(result_txs),
+                    )
+                    # Save updated DB before returning
+                    _save_cached_transactions(address, contract_address, all_txs_for_db)
+                    return result_txs[:maxLen]
 
-        # move start to the block after the last tx we got
         last_block = int(txs[-1]["blockNumber"])
         if last_block >= endBlock:
             break
@@ -118,8 +213,15 @@ def getAllERC20Transactions(address, maxLen, startBlock, endBlock, contract_addr
 
         time.sleep(0.2)  # be nice to the API
 
-    print('fetched transactions for', address, len(all_txs))
-    return all_txs
+    # Save the full updated snapshot for next time
+    _save_cached_transactions(address, contract_address, all_txs_for_db)
+
+    print("fetched transactions for", address, len(result_txs))
+    # Apply maxLen one last time in case it wasn't hit mid-loop
+    if maxLen is not None:
+        return result_txs[:maxLen]
+    return result_txs
+
 
 def clean_sandwich(x_axis, y_axis, k=1.5, neighbor_count=10):
     """
@@ -328,9 +430,45 @@ def getTokenTransfers(token_contract, startBlock, endBlock, address=None, max_pa
 
     return all_txs
 
-def getAllTransfers(token_contract=None, maxLen=None, startBlock=None, endBlock=None, holder_address=None):
-    all_txs = []
+import os
 
+DB_DIR = "databases"
+
+def _get_transfers_db_path(token_contract=None, holder_address=None):
+    """
+    Build a cache file path for transfers. Distinctive from ERC20 cache
+    by using the 'transfers__' prefix.
+    """
+    _ensure_db_dir()
+    token_part = (token_contract or "all").lower()
+    holder_part = (holder_address or "all").lower()
+    filename = f"transfers__{token_part}__{holder_part}.json"
+    return os.path.join(DB_DIR, filename)
+
+
+def _load_cached_transfers(token_contract=None, holder_address=None):
+    path = _get_transfers_db_path(token_contract, holder_address)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"Failed to load transfers cache ({token_contract}, {holder_address}): {e}")
+        return []
+
+
+def _save_cached_transfers(token_contract, holder_address, txs):
+    path = _get_transfers_db_path(token_contract, holder_address)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(txs, f)
+    except Exception as e:
+        print(f"Failed to save transfers cache ({token_contract}, {holder_address}): {e}")
+
+
+def getAllTransfers(token_contract=None, maxLen=None, startBlock=None, endBlock=None, holder_address=None):
     # --- determine startBlock if not explicitly given ---
     if startBlock is None:
         starts = []
@@ -355,16 +493,57 @@ def getAllTransfers(token_contract=None, maxLen=None, startBlock=None, endBlock=
     if endBlock is None:
         endBlock = 30_164_015
 
-    cur = int(startBlock)
+    startBlock = int(startBlock)
     endBlock = int(endBlock)
 
+    # --------- load cache ----------
+    cached_txs = _load_cached_transfers(token_contract, holder_address)
+
+    def in_range(tx):
+        b = int(tx["blockNumber"])
+        return startBlock <= b <= endBlock
+
+    # only cached txs within requested range
+    result_txs = [tx for tx in cached_txs if in_range(tx)]
+
+    # if cache alone already satisfies maxLen, just return
+    if maxLen is not None and len(result_txs) >= maxLen:
+        print(
+            "loaded transfers from cache (maxLen satisfied)",
+            len(result_txs),
+        )
+        return result_txs[:maxLen]
+
+    # figure out last cached block if any
+    if cached_txs:
+        last_cached_block = max(int(tx["blockNumber"]) for tx in cached_txs)
+    else:
+        last_cached_block = None
+
+    # if cache already covers up to endBlock, no need to fetch more
+    if last_cached_block is not None and last_cached_block >= endBlock:
+        print("loaded transfers from cache", len(result_txs))
+        if maxLen is not None:
+            return result_txs[:maxLen]
+        return result_txs
+
+    # starting point for new fetches
+    if last_cached_block is not None:
+        cur = max(startBlock, last_cached_block + 1)
+    else:
+        cur = startBlock
+
+    # we'll keep full DB content here (cache + new)
+    all_txs_for_db = list(cached_txs)
+
+    # --------- fetch new data from chain ----------
     while cur <= endBlock:
         txs = getTokenTransfers(
-            token_contract,      # can be None
+            token_contract,            # can be None
             cur,
             endBlock,
-            address=holder_address,  # can be None
-            max_pages=1
+            address=holder_address,   # can be None
+            max_pages=1,
         )
 
         print(token_contract, cur, endBlock, len(txs))
@@ -372,11 +551,17 @@ def getAllTransfers(token_contract=None, maxLen=None, startBlock=None, endBlock=
         if not txs:
             break
 
-        all_txs.extend(txs)
+        # extend DB snapshot
+        all_txs_for_db.extend(txs)
 
-        if maxLen is not None and len(all_txs) >= maxLen:
-            print("fetched transactions (maxLen reached)", len(all_txs))
-            return all_txs
+        # extend return set only with txs in requested range
+        for tx in txs:
+            if in_range(tx):
+                result_txs.append(tx)
+                if maxLen is not None and len(result_txs) >= maxLen:
+                    print("fetched transactions (maxLen reached)", len(result_txs))
+                    _save_cached_transfers(token_contract, holder_address, all_txs_for_db)
+                    return result_txs[:maxLen]
 
         last_block = int(txs[-1]["blockNumber"])
         if last_block >= endBlock:
@@ -385,8 +570,14 @@ def getAllTransfers(token_contract=None, maxLen=None, startBlock=None, endBlock=
         cur = last_block + 1
         time.sleep(0.2)
 
-    print("fetched transactions:", len(all_txs))
-    return all_txs
+    # save updated snapshot for next time
+    _save_cached_transfers(token_contract, holder_address, all_txs_for_db)
+
+    print("fetched transactions:", len(result_txs))
+    if maxLen is not None:
+        return result_txs[:maxLen]
+    return result_txs
+
 
 def flatten(lst):
     result = []
@@ -844,8 +1035,8 @@ def balance_change_of_holders_over_threshold(holders_snaps, threshold):
 #Example usage:
 if __name__ == "__main__":
     token0 = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
-    token1 = '0x0f7dc5d02cc1e1f5ee47854d534d332a1081ccc8'
-    pair = '0xf97503af8230a7e72909d6614f45e88168ff3c10'
+    token1 = '0x9778ac3d5a2f916aa9abf1eb85c207d990ca2655'
+    pair = '0x7bdb64fb70adb01c7bbfed98e4def7df70c8318b'
     maxLen = 10000000
     [x_axis, y_axis, liq, pool] = buildPoolChart(token0,token1,pair,maxLen , clean = 1)
     all_txs = getAllTransfers(token1, maxLen, 0, 30164015, holder_address=None)
